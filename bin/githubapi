@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+
+set -o errexit  # abort when any commands exits with error
+set -o pipefail # abort when any command in a pipe exits with error
+set -o nounset  # abort when any unset variable is used
+set -f # prevent bash from expanding glob
+trap 'echo "${SCRIPT_DIR}/${SCRIPT_NAME}: line ${LINENO}: exiting because of error";exit 1' ERR
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SCRIPT_NAME="$(cd $(dirname "$0") && pwd -P)/$(basename "$0")"
+
+shopt -s nocasematch
+
+if [[ "${trace:="0"}" -eq 1 ]];then
+  PS4='${LINENO}: '
+  set -x
+fi
+
+source $(dirname $0)/apihub_common_function.sh
+
+while getopts ":-:" OPTIONS; do 
+  case ${OPTIONS} in
+  *) case $OPTARG in
+  u|username) getarg GITHUB_USER ;;
+  private) private="true" ;;
+  public) private="false" ;;
+  l|local) local_rename="1" ;;
+  o|orgname) 
+    getarg GITHUB_ORGANISATION 
+    : ${private:="true"}
+    github_namespace="${GITHUB_ORGANISATION}"
+    users_orgs="orgs"
+    ;;
+  s|short) SHORT=1 ;;
+  r|raw_output) RAW_JSON_OUTPUT=1 ;;
+  p|page) getarg PAGE ;;
+esac; esac; done
+shift $((OPTIND - 1))
+
+read_rc_file
+
+: ${private:="false"}
+: ${github_namespace:="${GITHUB_USER}"}
+: ${users_orgs:="users"}
+: ${GITHUB_ORGANISATION:=""}
+: ${DESCRIPTION:=""}
+: ${PASSWORD:=""}
+: ${RAW_JSON_OUTPUT:=0}
+: ${local_rename:=0}
+
+[[ -z "${GITHUB_USER}" ]] && { echo "github user must be specified." >&2; exit 1; }
+
+if [[ "$1" = "create" ]]; then
+  shift
+  REPO_NAME="$1";shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+  [[ -n "$@" ]] && DESCRIPTION="$@"
+
+  team_setting=""
+  if [[ -n ${GITHUB_ORGANISATION} ]];then
+    url="https://api.github.com/orgs/${GITHUB_ORGANISATION}/repos"
+    team_setting=",\"team_id\":\"${team_id}\""
+  else
+    url="https://api.github.com/user/repos"
+  fi
+  curl \
+    -i \
+    -X POST \
+    -u "${GITHUB_USER}:$(get_password)" \
+    -d "{\
+          \"name\":\"${REPO_NAME}\"\
+         ,\"description\":\"${DESCRIPTION}\"\
+         ,\"auto_init\":true\
+         ,\"has_issues\":false\
+         ,\"has_wiki\":false\
+         ,\"has_downloads\":false\
+         ,\"private\":${private}\
+         ${team_setting}\
+       }" \
+    ${url}
+
+elif [[ "$1" = "add_team" ]]; then
+  shift
+  REPO_NAME="$1";shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+
+  if [[ -n ${GITHUB_ORGANISATION} ]];then
+    curl \
+      -i \
+      -X PUT \
+      -u "${GITHUB_USER}:$(get_password)" \
+      -d "{\"permission\":\"admin\"}" \
+      https://api.github.com/teams/${team_id}/repos/${GITHUB_ORGANISATION}/${REPO_NAME}
+  fi
+
+elif [[ "$1" = "createclone" ]]; then
+  shift
+  if [[ -n ${GITHUB_ORGANISATION} ]];then
+    $0 create -o ${GITHUB_ORGANISATION} $@
+    $0 clone -o ${GITHUB_ORGANISATION} $@
+  else
+    $0 create $@
+    $0 clone $@
+  fi
+
+elif [[ "$1" = "delete" ]]; then #!#
+  shift
+  REPO_NAME="$1"; shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+  read -p "If you are sure to delete Github Repository: '${REPO_NAME}' please type in the name again: " ENTERED_REPO_NAME
+  [[ "${REPO_NAME}" != "$ENTERED_REPO_NAME" ]] && {
+    echo "Entered Repository name: '${ENTERED_REPO_NAME}' does not match: '${REPO_NAME}'" >&2; exit 1;
+  }
+  curl \
+    -i \
+    -X DELETE \
+    -u "${GITHUB_USER}:$(get_password)" \
+    "https://api.github.com/repos/${github_namespace}/${REPO_NAME}"
+
+elif [[ "$1" = "clone" ]]; then #!#
+  shift
+  [[ -n "$1" ]] && { : ${REPO_NAME:="$1"}; shift; }
+  [[ -z "${REPO_NAME}" ]] && { echo "no repository name specified."; exit 1; }
+  git clone git@github.com:${github_namespace}/${REPO_NAME}.git
+
+elif [[ "$1" = "rename" ]]; then #!#
+  shift
+  REPO_NAME="$1"; shift
+  NEW_REPO_NAME="$1"; shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+  [[ -z "${NEW_REPO_NAME}" ]] && { echo "new repository name must be specified." >&2; exit 1; }
+  if [[ "$local_rename" -ne 1 ]];then
+    curl \
+      -s \
+      -u "${GITHUB_USER}:$(get_password)" \
+      -X PATCH \
+      -H "Content-Type:application/json" \
+      -d "{\"name\":\"${NEW_REPO_NAME}\"}" \
+      "https://api.github.com/repos/${github_namespace}/${REPO_NAME}"
+  fi
+
+  if [[ -d "${NEW_REPO_NAME}" ]];then
+    echo "folder with new name does already exists" >&2
+    exit 1
+  fi
+  if [[ -d "${REPO_NAME}" ]];then
+    :
+    cd ${REPO_NAME}
+    git remote set-url origin "$( git remote -v \
+      | sed -n '1p' \
+      | awk '{print $2}' \
+      | sed -e "s/\\b${REPO_NAME}\\b/${NEW_REPO_NAME}/g" 
+    )"
+    cd ..
+    mv ${REPO_NAME} ${NEW_REPO_NAME}
+  fi
+
+elif [[ "$1" = "info" ]]; then #!#
+  shift
+  REPO_NAME="$1"; shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+  curl -s \
+       -u "${GITHUB_USER}:$(get_password)" \
+       "https://api.github.com/repos/${github_namespace}/${REPO_NAME}"
+
+elif [[ "$1" = "teams" ]]; then #!#
+  shift
+  curl -s \
+       -u "${GITHUB_USER}:$(get_password)" \
+       "https://api.github.com/orgs/${github_namespace}/teams"
+
+elif [[ "$1" = "team" ]]; then #!#
+  shift
+  REPO_NAME="$1"; shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+  curl -s \
+       -u "${GITHUB_USER}:$(get_password)" \
+       "https://api.github.com/repos/${github_namespace}/${REPO_NAME}/teams"
+
+elif [[ "$1" = "hooks" ]]; then #!#
+  shift
+  REPO_NAME="$1"; shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+  curl -s \
+       -u "${GITHUB_USER}:$(get_password)" \
+       "https://api.github.com/repos/${github_namespace}/${REPO_NAME}/hooks"
+
+elif [[ "$1" = "issues" ]]; then #!#
+  shift
+  REPO_NAME="$1"; shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+  curl -s \
+       -u "${GITHUB_USER}:$(get_password)" \
+       "https://api.github.com/repos/${github_namespace}/${REPO_NAME}/issues"
+
+elif [[ "$1" = "list" ]]; then #!#
+  shift
+  RESPONSE="$(curl -s \
+    -u "${GITHUB_USER}:$(get_password)" \
+    "https://api.github.com/${users_orgs}/${github_namespace}/repos?\
+type=all\
+${PAGE+"&page=$PAGE"}\
+&per_page=100" \
+      )"
+#TODO is 100 the max for entries per page ?
+
+  if [[ "$RAW_JSON_OUTPUT" -eq 1 ]];then
+    echo "$RESPONSE"
+  else
+    echo "$RESPONSE" \
+      | jq -M 'map({name,description,ssh_url})' \
+      | jq -M -r '.[].name'
+  fi
+
+elif [[ "$1" = "add_docker_service" ]]; then #!#
+  shift
+  REPO_NAME="$1"; shift
+  [[ -z "${REPO_NAME}" ]] && { echo "repository name must be specified." >&2; exit 1; }
+  curl -s \
+    -u "${GITHUB_USER}:$(get_password)" \
+    -X POST \
+    --data-binary '{"name":"docker","active":true,"events":["push"],"config":{}}' \
+    "https://api.github.com/repos/${github_namespace}/${REPO_NAME}/hooks"
+
+
+elif [[ "$1" = "search" ]]; then #!#
+  shift
+  # https://developer.github.com/v3/search/#search-code
+  curl -s \
+    -u "${GITHUB_USER}:$(get_password)" \
+    -H 'Accept: application/vnd.github.v3.text-match+json' \
+    "https://api.github.com/search/code\
+?q=alpine+user:testfeld\
+&per_page=10\
+"
+# ?q=socat+in:file+filename:Dockerfile\
+
+elif [[ "$1" = "content" ]]; then #!#
+  shift
+  curl -s \
+    -u "${GITHUB_USER}:$(get_password)" \
+    "https://raw.githubusercontent.com/octokit/octokit.rb/master/README.md"
+fi
